@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Use Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Use Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install AWS SAM CLI
+        run: pip install aws-sam-cli
+
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: SAM build
+        run: sam build
+
+      - name: SAM package
+        run: sam package --s3-bucket "${{ vars.SAR_ARTIFACT_BUCKET }}" --output-template-file packaged.yaml
+
+      - name: SAM publish to Serverless Application Repository
+        run: sam publish --template packaged.yaml --region us-east-1
+
+      # After the first publish, set the SAR_APPLICATION_ID repo variable to the
+      # created application ARN so subsequent releases keep it publicly deployable.
+      - name: Make application publicly deployable
+        if: ${{ vars.SAR_APPLICATION_ID != '' }}
+        run: |
+          aws serverlessrepo put-application-policy \
+            --application-id "${{ vars.SAR_APPLICATION_ID }}" \
+            --statements Principals='*',Actions='Deploy'

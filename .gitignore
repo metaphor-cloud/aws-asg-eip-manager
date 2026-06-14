@@ -1,0 +1,23 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+env/
+
+# AWS SAM
+.aws-sam/
+packaged.yaml
+samconfig.local.toml
+
+# dotenv
+.env
+.env.*

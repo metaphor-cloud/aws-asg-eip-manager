@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - src/**
+      - tests/**
+      - requirements-dev.txt
+      - template.yaml
+  pull_request:
+    paths:
+      - src/**
+      - tests/**
+      - requirements-dev.txt
+      - template.yaml
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Use Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q

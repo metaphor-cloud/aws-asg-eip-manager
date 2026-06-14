@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Attaches a public ENI + Elastic IP to Auto Scaling Group instances on launch
+  and migrates/releases them on terminate, via ASG lifecycle hooks. Supports a
+  per-AZ EIP pool model for stable egress IPs across instance refreshes.
+
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: asg-eip-manager
+    Description: >-
+      Lifecycle-hook Lambda that gives Auto Scaling Group instances a public ENI
+      and a stable per-AZ Elastic IP, with zero-traffic-loss EIP migration on
+      instance refresh.
+    Author: Metaphor
+    LicenseUrl: LICENSE
+    ReadmeUrl: README.md
+    Labels: ['asg', 'eip', 'eni', 'nat', 'autoscaling', 'lifecycle-hook']
+    HomePageUrl: https://github.com/metaphor-cloud/aws-asg-eip-manager
+    SemanticVersion: 0.1.0
+    SourceCodeUrl: https://github.com/metaphor-cloud/aws-asg-eip-manager
+
+Parameters:
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (one per AZ) the public ENI is created in. Order defines EIP-pool partitioning.
+  PublicSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group applied to the public ENI.
+  AsgName:
+    Type: String
+    Description: Name of the Auto Scaling Group whose lifecycle actions this Lambda services.
+  EipAllocationIds:
+    Type: String
+    Default: ''
+    Description: >-
+      Comma-separated EIP allocation IDs, partitioned into EipsPerAz-sized pools
+      in PublicSubnets order. Leave empty for pure ephemeral (EipsPerAz=0).
+  EipsPerAz:
+    Type: Number
+    Default: 0
+    Description: >-
+      EIP pool size per AZ. 0 = ephemeral (allocate/release per instance);
+      1 = single stable IP migrated to the successor on refresh;
+      >=2 = blue/green pool of stable IPs.
+  EniDeviceIndex:
+    Type: Number
+    Default: 1
+    Description: Device index the public ENI is attached at.
+  DisableSrcDestCheck:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Disable source/dest check on the public ENI and the instance's primary ENI (required for NAT).
+  TagNamespace:
+    Type: String
+    Default: metaphor
+    Description: Namespace prefix for the tags this Lambda writes (e.g. <ns>:managed).
+  TargetGroupArn:
+    Type: String
+    Default: ''
+    Description: Optional GWLB/ELB target group ARN; the terminating instance is deregistered from it before EIP migration.
+  TargetPort:
+    Type: Number
+    Default: 6081
+    Description: Target port used when deregistering from TargetGroupArn.
+
+Conditions:
+  HasTargetGroup: !Not [!Equals [!Ref TargetGroupArn, '']]
+
+Resources:
+  EipManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-eip-manager'
+      Runtime: python3.12
+      Handler: app.handler
+      CodeUri: src/
+      Timeout: 600
+      MemorySize: 256
+      Environment:
+        Variables:
+          PUBLIC_SUBNETS: !Join [',', !Ref PublicSubnets]
+          PUBLIC_SECURITY_GROUP: !Ref PublicSecurityGroup
+          ASG_NAME: !Ref AsgName
+          STACK_NAME: !Ref AWS::StackName
+          EIP_ALLOCATION_IDS: !Ref EipAllocationIds
+          EIPS_PER_AZ: !Ref EipsPerAz
+          ENI_DEVICE_INDEX: !Ref EniDeviceIndex
+          DISABLE_SRC_DEST_CHECK: !Ref DisableSrcDestCheck
+          TAG_NAMESPACE: !Ref TagNamespace
+          TARGET_GROUP_ARN: !Ref TargetGroupArn
+          TARGET_PORT: !Ref TargetPort
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # EC2 ENI/EIP actions cannot be resource-scoped at create time.
+            - Effect: Allow
+              Action:
+                - ec2:CreateNetworkInterface
+                - ec2:DeleteNetworkInterface
+                - ec2:DescribeNetworkInterfaces
+                - ec2:AttachNetworkInterface
+                - ec2:DetachNetworkInterface
+                - ec2:ModifyNetworkInterfaceAttribute
+                - ec2:DescribeInstances
+                - ec2:DescribeSubnets
+                - ec2:DescribeAddresses
+                - ec2:AllocateAddress
+                - ec2:ReleaseAddress
+                - ec2:AssociateAddress
+                - ec2:DisassociateAddress
+                - ec2:CreateTags
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - autoscaling:CompleteLifecycleAction
+                - autoscaling:DescribeAutoScalingGroups
+              Resource: '*'
+            - !If
+              - HasTargetGroup
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DeregisterTargets
+                  - elasticloadbalancing:DescribeTargetHealth
+                Resource: '*'
+              - !Ref AWS::NoValue
+      Events:
+        Lifecycle:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.autoscaling
+              detail-type:
+                - EC2 Instance-launch Lifecycle Action
+                - EC2 Instance-terminate Lifecycle Action
+              detail:
+                AutoScalingGroupName:
+                  - !Ref AsgName
+
+  EipManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-eip-manager'
+      RetentionInDays: 7
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the EIP-manager Lambda.
+    Value: !GetAtt EipManagerFunction.Arn
+  FunctionName:
+    Description: Name of the EIP-manager Lambda.
+    Value: !Ref EipManagerFunction

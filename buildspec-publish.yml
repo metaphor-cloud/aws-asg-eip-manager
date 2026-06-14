@@ -1,0 +1,44 @@
+version: 0.2
+
+# Packages and publishes the SAM app to SAR. Idempotent on the template's
+# SemanticVersion: if that version is already published, the publish is treated
+# as a no-op so re-running on an unchanged branch is safe. Bump SemanticVersion
+# in template.yaml to cut a new release.
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install aws-sam-cli cfn-lint
+  build:
+    commands:
+      - cfn-lint template.yaml
+      - sam build
+      - sam package --s3-bucket "$SAM_PACKAGE_BUCKET" --output-template-file packaged.yaml
+      - |
+        set +e
+        OUTPUT=$(sam publish --template packaged.yaml --region "$AWS_REGION" 2>&1)
+        STATUS=$?
+        echo "$OUTPUT"
+        if [ $STATUS -ne 0 ]; then
+          if echo "$OUTPUT" | grep -qiE "already exists|already published|same.*version|version.*exists"; then
+            echo "SemanticVersion already published; treating as no-op."
+          else
+            exit $STATUS
+          fi
+        fi
+        set -e
+      - |
+        if [ "$MAKE_PUBLIC" = "true" ]; then
+          APP_ID=$(aws serverlessrepo list-applications \
+            --query "Applications[?Name=='$APP_NAME'].ApplicationId | [0]" --output text)
+          if [ -n "$APP_ID" ] && [ "$APP_ID" != "None" ]; then
+            aws serverlessrepo put-application-policy \
+              --application-id "$APP_ID" \
+              --statements Principals='*',Actions='Deploy'
+            echo "Granted public Deploy on $APP_ID"
+          else
+            echo "Could not resolve ApplicationId for $APP_NAME; skipping public-share."
+          fi
+        fi

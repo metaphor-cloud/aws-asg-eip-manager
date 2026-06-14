@@ -1,0 +1,335 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CI/CD pipeline for aws-asg-eip-manager: a CodePipeline (V2) that sources from
+  GitHub via a CodeStar/CodeConnections connection, runs the pytest suite, then
+  packages and publishes the SAM app to the AWS Serverless Application Repository
+  (SAR). Publish is idempotent on the template's SemanticVersion - re-runs that
+  do not bump the version are a no-op, so pushing to the branch is safe; cut a
+  release by bumping SemanticVersion in template.yaml. Deploy this once in
+  us-east-1 (SAR is regional).
+
+Parameters:
+  CodeStarConnectionArn:
+    Type: String
+    Description: >-
+      ARN of an existing CodeStar/CodeConnections connection to GitHub
+      (arn:aws:codeconnections:REGION:ACCOUNT:connection/...). Create it once in
+      the console (Developer Tools > Connections) and authorize the GitHub org.
+
+  GitHubRepo:
+    Type: String
+    Default: metaphor-cloud/aws-asg-eip-manager
+    Description: GitHub repository in owner/repo form.
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch that triggers the pipeline.
+
+  ApplicationName:
+    Type: String
+    Default: asg-eip-manager
+    Description: SAR application name (must match the Name in template.yaml metadata).
+
+  MakePublic:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Grant public Deploy on the SAR application after publishing.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Buckets
+  # ---------------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-pipeline-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # SAM packaging artifacts; SAR reads from here at publish time.
+  SamPackageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-sam-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  SamPackageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SamPackageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowServerlessRepoRead
+            Effect: Allow
+            Principal:
+              Service: serverlessrepo.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SamPackageBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt SamPackageBucket.Arn
+              - !Sub '${SamPackageBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ---------------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*'
+        - PolicyName: Artifacts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+                  - !GetAtt SamPackageBucket.Arn
+                  - !Sub '${SamPackageBucket.Arn}/*'
+        - PolicyName: PublishToServerlessRepo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - serverlessrepo:CreateApplication
+                  - serverlessrepo:ListApplications
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - serverlessrepo:UpdateApplication
+                  - serverlessrepo:GetApplication
+                  - serverlessrepo:CreateApplicationVersion
+                  - serverlessrepo:ListApplicationVersions
+                  - serverlessrepo:GetApplicationPolicy
+                  - serverlessrepo:PutApplicationPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:serverlessrepo:${AWS::Region}:${AWS::AccountId}:applications/*'
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                  - codeconnections:UseConnection
+                Resource: !Ref CodeStarConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - !GetAtt TestProject.Arn
+                  - !GetAtt PublishProject.Arn
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild projects
+  # ---------------------------------------------------------------------------
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${AWS::StackName}-test'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-test.yml
+      TimeoutInMinutes: 15
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${AWS::StackName}-test'
+
+  PublishProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${AWS::StackName}-publish'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: SAM_PACKAGE_BUCKET
+            Value: !Ref SamPackageBucket
+          - Name: APP_NAME
+            Value: !Ref ApplicationName
+          - Name: MAKE_PUBLIC
+            Value: !Ref MakePublic
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-publish.yml
+      TimeoutInMinutes: 20
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${AWS::StackName}-publish'
+
+  # ---------------------------------------------------------------------------
+  # Pipeline
+  # ---------------------------------------------------------------------------
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${AWS::StackName}'
+      PipelineType: V2
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches:
+                  Includes:
+                    - !Ref GitHubBranch
+                FilePaths:
+                  Includes:
+                    - src/**
+                    - tests/**
+                    - template.yaml
+                    - requirements-dev.txt
+                    - buildspec-test.yml
+                    - buildspec-publish.yml
+                  Excludes:
+                    - '**/*.md'
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Test
+          Actions:
+            - Name: Test
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref TestProject
+              InputArtifacts:
+                - Name: SourceOutput
+        - Name: Publish
+          Actions:
+            - Name: Publish
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref PublishProject
+              InputArtifacts:
+                - Name: SourceOutput
+
+Outputs:
+  PipelineName:
+    Description: CodePipeline name.
+    Value: !Ref Pipeline
+  SamPackageBucketName:
+    Description: Bucket SAM packages into and SAR reads from.
+    Value: !Ref SamPackageBucket

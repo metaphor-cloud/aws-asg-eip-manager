@@ -121,16 +121,39 @@ sam validate --lint
 sam build
 ```
 
-## Publishing to SAR
+## CI/CD (AWS CodePipeline)
 
-CI publishes on a published GitHub release (`.github/workflows/release.yml`). It
-requires these repo settings:
+`cfn/pipeline.yml` provisions a CodePipeline (V2) that, on every push to the
+branch, sources from GitHub, runs the test suite (`buildspec-test.yml`), then
+packages and publishes the app to SAR (`buildspec-publish.yml`). It also creates
+the CodeBuild/CodePipeline roles and the S3 buckets, including the SAR-readable
+packaging bucket.
 
-- `vars.AWS_ROLE_ARN` - an OIDC-assumable role with SAR + S3 publish permissions.
-- `vars.SAR_ARTIFACT_BUCKET` - an S3 bucket in `us-east-1` for `sam package` artifacts.
-- `vars.SAR_APPLICATION_ID` - (set after the first publish) the created
-  application ARN, so subsequent releases keep it publicly deployable via
-  `serverlessrepo put-application-policy` granting `Deploy` to `*`.
+Publishing is **idempotent on the `SemanticVersion`** in `template.yaml`: if that
+version is already in SAR, the publish step is a no-op, so pushing to the branch
+is safe. To cut a release, bump `SemanticVersion` and push. The public Deploy
+grant (`serverlessrepo put-application-policy` to `*`) runs each time and is
+idempotent too.
+
+One-time setup:
+
+1. In the console (Developer Tools > Connections), create a CodeConnections
+   connection to the GitHub org and authorize it. Copy its ARN.
+2. Deploy the pipeline in `us-east-1` (SAR is regional):
+
+   ```sh
+   aws cloudformation deploy \
+     --template-file cfn/pipeline.yml \
+     --stack-name asg-eip-manager-pipeline \
+     --capabilities CAPABILITY_IAM \
+     --region us-east-1 \
+     --parameter-overrides CodeStarConnectionArn=<connection-arn>
+   ```
+
+Parameters: `CodeStarConnectionArn` (required), `GitHubRepo`
+(default `metaphor-cloud/aws-asg-eip-manager`), `GitHubBranch` (default `main`),
+`ApplicationName` (default `asg-eip-manager`, must match the metadata Name),
+`MakePublic` (default `true`).
 
 ## License
 
